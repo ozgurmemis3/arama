@@ -1,1 +1,174 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sesli Arama Prototipi</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.4; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1rem; margin: 20px 0 6px; }
+  textarea { width: 100%; height: 90px; font-size: 12px; box-sizing: border-box; }
+  button { padding: 10px 14px; font-size: 1rem; margin: 4px 4px 4px 0; }
+  label { display: block; margin: 4px 0; }
+  #stats { font-family: monospace; font-size: 13px; background: #eee; color: #111; padding: 8px; border-radius: 6px; white-space: pre; }
+  #durum { font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Yüksek kaliteli sesli arama</h1>
 
+<h2>Ses ayarları (aramadan önce seç)</h2>
+<label><input type="checkbox" id="aec" checked> Yankı engelleme</label>
+<label><input type="checkbox" id="ns"> Gürültü bastırma</label>
+<label><input type="checkbox" id="agc"> Otomatik kazanç</label>
+<label>Bitrate (kbps): <input type="number" id="kbps" value="128" min="16" max="256"></label>
+
+<h2>1) Arayan taraf</h2>
+<button id="btnOffer">Arama başlat (teklif oluştur)</button>
+<textarea id="offerOut" readonly placeholder="Çıkan metni partnerine gönder"></textarea>
+
+<h2>2) Aranan taraf</h2>
+<textarea id="offerIn" placeholder="Arayanın teklifini yapıştır"></textarea>
+<button id="btnAnswer">Cevap oluştur</button>
+<textarea id="answerOut" readonly placeholder="Çıkan cevabı arayana gönder"></textarea>
+
+<h2>3) Arayan taraf, cevabı uygula</h2>
+<textarea id="answerIn" placeholder="Gelen cevabı yapıştır"></textarea>
+<button id="btnConnect">Bağlan</button>
+
+<h2>Durum</h2>
+<div id="durum">Hazır</div>
+<div id="stats"></div>
+<button id="btnHang">Kapat</button>
+<audio id="remote" autoplay playsinline></audio>
+
+<script>
+const $ = id => document.getElementById(id);
+let pc, localStream, statsTimer;
+
+function setDurum(t) { $('durum').textContent = t; }
+
+function tuneOpus(sdp, kbps) {
+  const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/);
+  if (!m) return sdp;
+  const pt = m[1];
+  const extra = 'maxaveragebitrate=' + (kbps * 1000) +
+    ';maxplaybackrate=48000;stereo=0;sprop-stereo=0;useinbandfec=1;usedtx=0;cbr=1';
+  const re = new RegExp('a=fmtp:' + pt + ' (.*)');
+  if (re.test(sdp)) {
+    return sdp.replace(re, (line, p) => {
+      const clean = p.replace(/;?(maxaveragebitrate|maxplaybackrate|stereo|sprop-stereo|usedtx|useinbandfec|cbr)=[^;]*/g, '').replace(/^;/, '');
+      return 'a=fmtp:' + pt + ' ' + (clean ? clean + ';' : '') + extra;
+    });
+  }
+  return sdp.replace(m[0], m[0] + '\r\na=fmtp:' + pt + ' ' + extra);
+}
+
+async function createPC() {
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+  localStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: $('aec').checked,
+      noiseSuppression: $('ns').checked,
+      autoGainControl: $('agc').checked,
+      channelCount: 1,
+      sampleRate: 48000
+    }
+  });
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.ontrack = e => { $('remote').srcObject = e.streams[0]; };
+  pc.onconnectionstatechange = () => {
+    setDurum('Bağlantı: ' + pc.connectionState);
+    if (pc.connectionState === 'connected') startStats();
+  };
+}
+
+function waitIce() {
+  return new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === 'complete') res();
+    };
+    setTimeout(res, 4000);
+  });
+}
+
+function setSenderBitrate() {
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+  if (!sender) return;
+  const p = sender.getParameters();
+  if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+  p.encodings[0].maxBitrate = $('kbps').value * 1000;
+  sender.setParameters(p).catch(console.warn);
+}
+
+$('btnOffer').onclick = async () => {
+  try {
+    await createPC();
+    const offer = await pc.createOffer();
+    offer.sdp = tuneOpus(offer.sdp, +$('kbps').value);
+    await pc.setLocalDescription(offer);
+    await waitIce();
+    $('offerOut').value = JSON.stringify(pc.localDescription);
+    setDurum('Teklifi partnerine gönder, cevabını bekle');
+  } catch (e) { setDurum('Hata: ' + e.message); }
+};
+
+$('btnAnswer').onclick = async () => {
+  try {
+    await createPC();
+    const offer = JSON.parse($('offerIn').value);
+    await pc.setRemoteDescription(offer);
+    const answer = await pc.createAnswer();
+    answer.sdp = tuneOpus(answer.sdp, +$('kbps').value);
+    await pc.setLocalDescription(answer);
+    await waitIce();
+    setSenderBitrate();
+    $('answerOut').value = JSON.stringify(pc.localDescription);
+    setDurum('Cevabı arayana gönder');
+  } catch (e) { setDurum('Hata: ' + e.message); }
+};
+
+$('btnConnect').onclick = async () => {
+  try {
+    const answer = JSON.parse($('answerIn').value);
+    await pc.setRemoteDescription(answer);
+    setSenderBitrate();
+    setDurum('Bağlanıyor...');
+  } catch (e) { setDurum('Hata: ' + e.message); }
+};
+
+$('btnHang').onclick = () => {
+  clearInterval(statsTimer);
+  if (pc) pc.close();
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+  setDurum('Kapatıldı');
+};
+
+function startStats() {
+  let lastBytes = 0, lastTs = 0;
+  statsTimer = setInterval(async () => {
+    const stats = await pc.getStats();
+    let out = '';
+    stats.forEach(r => {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        const dt = (r.timestamp - lastTs) / 1000;
+        const kbps = lastTs ? ((r.bytesReceived - lastBytes) * 8 / dt / 1000).toFixed(0) : '...';
+        lastBytes = r.bytesReceived; lastTs = r.timestamp;
+        out += 'Gelen bitrate : ' + kbps + ' kbps\n';
+        out += 'Kayıp paket   : ' + r.packetsLost + '\n';
+        out += 'Jitter        : ' + (r.jitter * 1000).toFixed(1) + ' ms\n';
+      }
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) {
+        out += 'Gidiş-dönüş   : ' + (r.currentRoundTripTime * 1000).toFixed(0) + ' ms\n';
+      }
+    });
+    $('stats').textContent = out;
+  }, 1000);
+}
+</script>
+</body>
+</html>
